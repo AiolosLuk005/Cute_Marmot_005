@@ -4,11 +4,11 @@
 
     <application
         android:allowBackup="true"
-        android:label="Marmot"
+        android:label="Cute_Marmot"
         android:supportsRtl="true"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar">
         <activity
-            android:name=".MainActivity"
+            android:name="com.aiolos.cutemarmot.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>

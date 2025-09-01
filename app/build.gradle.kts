@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.aiolos.marmot"
+    namespace = "com.aiolos.cutemarmot"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.aiolos.marmot"
+        applicationId = "com.aiolos.cutemarmot"
         minSdk = 28
         targetSdk = 35
         versionCode = 1

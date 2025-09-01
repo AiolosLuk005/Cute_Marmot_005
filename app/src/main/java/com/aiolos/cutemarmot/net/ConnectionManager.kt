@@ -1,6 +1,6 @@
-package com.aiolos.marmot.net
+package com.aiolos.cutemarmot.net
 
-import com.aiolos.marmot.model.*
+import com.aiolos.cutemarmot.model.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow

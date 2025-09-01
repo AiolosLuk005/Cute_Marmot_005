@@ -1,4 +1,4 @@
-package com.aiolos.marmot.ui
+package com.aiolos.cutemarmot.ui
 
 import android.net.Uri
 import androidx.compose.animation.core.animateFloatAsState
@@ -16,10 +16,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
-import com.aiolos.marmot.model.HandOff
-import com.aiolos.marmot.model.Hello
-import com.aiolos.marmot.model.Message
-import com.aiolos.marmot.net.ConnectionManager
+import com.aiolos.cutemarmot.model.HandOff
+import com.aiolos.cutemarmot.model.Hello
+import com.aiolos.cutemarmot.model.Message
+import com.aiolos.cutemarmot.net.ConnectionManager
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)

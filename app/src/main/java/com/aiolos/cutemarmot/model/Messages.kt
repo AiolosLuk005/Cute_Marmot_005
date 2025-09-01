@@ -1,4 +1,4 @@
-package com.aiolos.marmot.model
+package com.aiolos.cutemarmot.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable

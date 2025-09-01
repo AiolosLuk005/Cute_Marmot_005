@@ -1,4 +1,4 @@
-package com.aiolos.marmot
+package com.aiolos.cutemarmot
 
 import android.net.Uri
 import android.os.Bundle
@@ -7,7 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import com.aiolos.marmot.ui.MainScreen
+import com.aiolos.cutemarmot.ui.MainScreen
 
 class MainActivity : ComponentActivity() {
 
