@@ -1,4 +1,4 @@
-# Marmot (Two-Screen Handoff MVP)
+# Cute_Marmot (Two-Screen Handoff MVP)
 
 Minimal Android app in **Kotlin + Jetpack Compose** to demo LAN-based "handoff" between two phones.
 
