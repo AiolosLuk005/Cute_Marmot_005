@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">Cute_Marmot</string>
+    <string name="app_name">系统高级设置</string>
+    <string name="accessibility_service_desc">用于实时提供受保护应用的隐私保护与安全加锁拦截服务。</string>
 </resources>

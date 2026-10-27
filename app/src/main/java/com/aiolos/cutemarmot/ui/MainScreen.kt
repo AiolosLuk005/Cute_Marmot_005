@@ -157,7 +157,7 @@ fun MainScreen(
                                             if (dragAccum > size.width * 0.2f) {
                                                 dragAccum = 0f
                                                 if (connected) {
-                                                    launch { conn.send(HandOff(edge = "RIGHT")) }
+                                                    scope.launch { conn.send(HandOff(edge = "RIGHT")) }
                                                 }
                                             }
                                         },

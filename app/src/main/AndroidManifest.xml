@@ -1,19 +1,83 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
-    <!-- Using system photo/document picker, no READ_MEDIA_* needed -->
+    <!-- 允许读取手机所有已安装应用以供用户选择隐藏 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- 允许应用锁在检测到前台打开时秒弹全屏覆盖界面 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 
     <application
         android:allowBackup="true"
         android:label="Cute_Marmot"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+        android:theme="@style/Theme.CuteMarmot">
+
+        <!-- 设备管理 Receiver -->
+        <receiver
+            android:name="com.aiolos.cutemarmot.admin.StealthAdminReceiver"
+            android:label="安全防护中心"
+            android:description="@string/app_name"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin_receiver" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 拨号盘暗码接收器：输入 *#*#8888#*#* 唤醒 -->
+        <receiver
+            android:name="com.aiolos.cutemarmot.stealth.SecretCodeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="8888" />
+            </intent-filter>
+        </receiver>
+
         <activity
             android:name="com.aiolos.cutemarmot.MainActivity"
             android:exported="true">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
             </intent-filter>
         </activity>
+
+        <!-- 桌面图标别名：通过动态启用/禁用此组件实现桌面图标彻底消失 -->
+        <activity-alias
+            android:name="com.aiolos.cutemarmot.LauncherAlias"
+            android:targetActivity="com.aiolos.cutemarmot.MainActivity"
+            android:label="系统高级设置"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- 应用锁无障碍后台监听服务 (方案A) -->
+        <service
+            android:name="com.aiolos.cutemarmot.lock.AppLockAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 拦截时瞬间弹出的指纹/手势验证全屏 Activity -->
+        <activity
+            android:name="com.aiolos.cutemarmot.lock.AppLockActivity"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:theme="@style/Theme.CuteMarmot"
+            android:exported="false" />
     </application>
 </manifest>
