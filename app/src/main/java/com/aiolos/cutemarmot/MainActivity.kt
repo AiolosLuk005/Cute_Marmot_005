@@ -23,6 +23,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.aiolos.cutemarmot.shizuku.ShizukuManager.init()
         biometricHelper = BiometricSecurityHelper(this)
         handleIntent(intent)
 

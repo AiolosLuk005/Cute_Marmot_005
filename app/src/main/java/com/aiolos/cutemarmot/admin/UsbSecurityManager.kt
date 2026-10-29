@@ -14,7 +14,7 @@ class UsbSecurityManager(private val context: Context) {
     /**
      * 检测当前应用是否具备 Device Owner 权限
      */
-    private fun isDeviceOwner(): Boolean = dpm.isDeviceOwnerApp(context.packageName)
+    fun isDeviceOwner(): Boolean = dpm.isDeviceOwnerApp(context.packageName)
 
     /**
      * 禁用或允许通过 USB 数据线传输文件 (MTP/PTP 盘符)

@@ -1,48 +1,23 @@
 package com.aiolos.cutemarmot.stealth
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.pm.PackageManager
-import android.util.Log
 
 class IconHideManager(private val context: Context) {
 
-    private val pm = context.packageManager
-    private val launcherAlias = ComponentName(context, "com.aiolos.cutemarmot.LauncherAlias")
+    private val prefs = context.getSharedPreferences("stealth_prefs", Context.MODE_PRIVATE)
 
     /**
-     * 判断当前桌面图标是否已经被隐藏
+     * 判断当前是否处于隐蔽伪装状态
      */
     fun isIconHidden(): Boolean {
-        val state = pm.getComponentEnabledSetting(launcherAlias)
-        return state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+        return prefs.getBoolean("icon_stealth_disguised", true)
     }
 
     /**
-     * 设置桌面图标是否隐藏
-     * @param hidden true: 从桌面彻底隐形; false: 恢复桌面图标
+     * 设置桌面伪装状态（始终保持「系统高级设置」伪装，避免因组件禁用导致三星桌面闪退或打不开）
      */
     fun setIconHidden(hidden: Boolean): Boolean {
-        return try {
-            val newState = if (hidden) {
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-            } else {
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            }
-            pm.setComponentEnabledSetting(
-                launcherAlias,
-                newState,
-                PackageManager.DONT_KILL_APP
-            )
-            Log.i(TAG, "更新桌面图标状态 hidden=$hidden 成功")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "更新桌面图标失败: ${e.message}")
-            false
-        }
-    }
-
-    companion object {
-        private const val TAG = "IconHideManager"
+        prefs.edit().putBoolean("icon_stealth_disguised", hidden).apply()
+        return true
     }
 }

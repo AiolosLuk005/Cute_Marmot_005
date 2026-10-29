@@ -7,6 +7,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.util.Log
+import com.aiolos.cutemarmot.shizuku.ShizukuManager
 
 data class AppInfoItem(
     val packageName: String,
@@ -17,16 +18,69 @@ data class AppInfoItem(
     var isLocked: Boolean = false
 )
 
+enum class HideBackendMode {
+    DEVICE_OWNER,
+    SHIZUKU,
+    NONE
+}
+
 class AppHideManager(private val context: Context) {
 
     private val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
     val adminComponent = ComponentName(context, StealthAdminReceiver::class.java)
+    private val prefs = context.getSharedPreferences("stealth_hide_manager_prefs", Context.MODE_PRIVATE)
+
+    /**
+     * 获取已被 Cute Marmot 记录为隐藏状态的包名集合
+     */
+    fun getHiddenPackages(): Set<String> {
+        return prefs.getStringSet("hidden_packages_set", emptySet()) ?: emptySet()
+    }
+
+    private fun setHiddenPackageRecord(packageName: String, hidden: Boolean) {
+        val current = getHiddenPackages().toMutableSet()
+        if (hidden) {
+            current.add(packageName)
+        } else {
+            current.remove(packageName)
+        }
+        prefs.edit().putStringSet("hidden_packages_set", current).apply()
+    }
 
     /**
      * 检测当前应用是否已被授权为 Device Owner (设备所有者)
      */
     fun isDeviceOwner(): Boolean {
-        return dpm.isDeviceOwnerApp(context.packageName)
+        return try {
+            dpm.isDeviceOwnerApp(context.packageName)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 检测 Shizuku 权限是否就绪
+     */
+    fun isShizukuReady(): Boolean {
+        return ShizukuManager.isPermissionGranted()
+    }
+
+    /**
+     * 检测当前是否具备隐藏/冻结应用能力（满足 Device Owner 或 Shizuku 任意一种即可）
+     */
+    fun canHideApps(): Boolean {
+        return isDeviceOwner() || isShizukuReady()
+    }
+
+    /**
+     * 获取当前生效的隐藏后端模式
+     */
+    fun getCurrentMode(): HideBackendMode {
+        return when {
+            isDeviceOwner() -> HideBackendMode.DEVICE_OWNER
+            isShizukuReady() -> HideBackendMode.SHIZUKU
+            else -> HideBackendMode.NONE
+        }
     }
 
     /**
@@ -35,18 +89,32 @@ class AppHideManager(private val context: Context) {
      * @return true 表示成功
      */
     fun hideApp(packageName: String): Boolean {
-        if (!isDeviceOwner()) {
-            Log.e(TAG, "无法隐藏应用：当前应用并非 Device Owner")
-            return false
+        // 1. 若拥有 Device Owner 权限则优先走 DPM
+        if (isDeviceOwner()) {
+            try {
+                val result = dpm.setApplicationHidden(adminComponent, packageName, true)
+                Log.i(TAG, "DeviceOwner 模式隐藏应用 $packageName: $result")
+                if (result) {
+                    setHiddenPackageRecord(packageName, true)
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "DeviceOwner 隐藏失败，尝试 Shizuku 备用: ${e.message}")
+            }
         }
-        return try {
-            val result = dpm.setApplicationHidden(adminComponent, packageName, true)
-            Log.i(TAG, "隐藏应用 $packageName: $result")
-            result
-        } catch (e: SecurityException) {
-            Log.e(TAG, "隐藏应用权限不足: ${e.message}")
-            false
+
+        // 2. 走 Shizuku 模式 (pm uninstall -k --user 0)
+        if (isShizukuReady()) {
+            val result = ShizukuManager.hideAppSync(packageName)
+            Log.i(TAG, "Shizuku 模式隐藏应用 $packageName: $result")
+            if (result) {
+                setHiddenPackageRecord(packageName, true)
+                return true
+            }
         }
+
+        Log.e(TAG, "无法隐藏应用：既不是 Device Owner，也没有 Shizuku 授权")
+        return false
     }
 
     /**
@@ -55,30 +123,51 @@ class AppHideManager(private val context: Context) {
      * @return true 表示成功
      */
     fun unhideApp(packageName: String): Boolean {
-        if (!isDeviceOwner()) {
-            Log.e(TAG, "无法解冻应用：当前应用并非 Device Owner")
-            return false
+        // 1. 若拥有 Device Owner 权限则优先走 DPM
+        if (isDeviceOwner()) {
+            try {
+                val result = dpm.setApplicationHidden(adminComponent, packageName, false)
+                Log.i(TAG, "DeviceOwner 模式恢复应用 $packageName: $result")
+                if (result) {
+                    setHiddenPackageRecord(packageName, false)
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "DeviceOwner 恢复失败，尝试 Shizuku 备用: ${e.message}")
+            }
         }
-        return try {
-            val result = dpm.setApplicationHidden(adminComponent, packageName, false)
-            Log.i(TAG, "恢复应用 $packageName: $result")
-            result
-        } catch (e: SecurityException) {
-            Log.e(TAG, "恢复应用失败: ${e.message}")
-            false
+
+        // 2. 走 Shizuku 模式 (cmd package install-existing --user 0)
+        if (isShizukuReady()) {
+            val result = ShizukuManager.unhideAppSync(packageName)
+            Log.i(TAG, "Shizuku 模式恢复应用 $packageName: $result")
+            if (result) {
+                setHiddenPackageRecord(packageName, false)
+                return true
+            }
         }
+
+        Log.e(TAG, "无法恢复应用：既不是 Device Owner，也没有 Shizuku 授权")
+        return false
     }
 
     /**
      * 检查某个应用当前是否已被隐藏
      */
     fun isAppHidden(packageName: String): Boolean {
-        if (!isDeviceOwner()) return false
-        return try {
-            dpm.isApplicationHidden(adminComponent, packageName)
-        } catch (e: Exception) {
-            false
+        // 1. 检查 Device Owner 标志
+        if (isDeviceOwner()) {
+            try {
+                if (dpm.isApplicationHidden(adminComponent, packageName)) return true
+            } catch (_: Exception) {}
         }
+
+        // 2. 检查 Cute Marmot 维护的隐藏清单
+        if (getHiddenPackages().contains(packageName)) {
+            return true
+        }
+
+        return false
     }
 
     /**
@@ -87,7 +176,6 @@ class AppHideManager(private val context: Context) {
     fun getInstalledApps(): List<AppInfoItem> {
         val pm = context.packageManager
         val flags = PackageManager.GET_META_DATA or
-                PackageManager.MATCH_UNINSTALLED_PACKAGES or
                 PackageManager.MATCH_DISABLED_COMPONENTS
         val installed = pm.getInstalledApplications(flags)
         val list = mutableListOf<AppInfoItem>()

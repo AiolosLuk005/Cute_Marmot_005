@@ -62,4 +62,9 @@ dependencies {
 
     // Image loading for local Uri
     implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // Shizuku API for rootless ADB app hiding
+    val shizukuVersion = "13.1.5"
+    implementation("dev.rikka.shizuku:api:$shizukuVersion")
+    implementation("dev.rikka.shizuku:provider:$shizukuVersion")
 }

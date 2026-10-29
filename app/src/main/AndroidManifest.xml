@@ -4,6 +4,11 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
     <!-- 允许应用锁在检测到前台打开时秒弹全屏覆盖界面 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <!-- 允许读取真实 Wi-Fi 和网络连接状态，以在高仿系统设置中真实呈现 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <!-- Shizuku API 授权 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
 
     <application
         android:allowBackup="true"
@@ -35,29 +40,27 @@
                 <data
                     android:scheme="android_secret_code"
                     android:host="8888" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="1111" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="2222" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="3333" />
             </intent-filter>
         </receiver>
 
         <activity
             android:name="com.aiolos.cutemarmot.MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-            </intent-filter>
-        </activity>
-
-        <!-- 桌面图标别名：通过动态启用/禁用此组件实现桌面图标彻底消失 -->
-        <activity-alias
-            android:name="com.aiolos.cutemarmot.LauncherAlias"
-            android:targetActivity="com.aiolos.cutemarmot.MainActivity"
             android:label="系统高级设置"
-            android:enabled="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity-alias>
+        </activity>
 
         <!-- 应用锁无障碍后台监听服务 (方案A) -->
         <service
@@ -79,5 +82,14 @@
             android:launchMode="singleInstance"
             android:theme="@style/Theme.CuteMarmot"
             android:exported="false" />
+
+        <!-- Shizuku Provider: 接收并维系 Shizuku 特权 Binder 通信 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>
