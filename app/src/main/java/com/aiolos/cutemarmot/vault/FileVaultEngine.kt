@@ -1,45 +1,42 @@
 package com.aiolos.cutemarmot.vault
 
 import android.content.Context
-import android.media.MediaScannerConnection
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
-import android.util.Log
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.system.Os
+import android.util.Log
+import java.io.*
 import java.security.KeyStore
+import java.security.MessageDigest
+import java.util.UUID
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
-import java.io.*
-import java.security.SecureRandom
-import javax.crypto.Cipher
-import javax.crypto.CipherInputStream
-import javax.crypto.CipherOutputStream
-import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
-
-import com.aiolos.cutemarmot.shizuku.ShizukuManager
 
 data class VaultFileItem(
     val id: String,
     val originalName: String,
-    val originalPath: String? = null,
+    val originalPath: String? = null, // Historical display information only.
     val mimeType: String,
     val sizeBytes: Long,
     val encryptedFile: File
 )
 
-class FileVaultEngine(private val context: Context) {
+enum class ImportResult { FAILED, SOURCE_REMOVED, SOURCE_RETAINED }
+enum class ExportResult { FAILED, EXPORTED, EXPORTED_LEGACY_RETAINED }
 
-    private val vaultDir: File = File(context.filesDir, "stealth_vault").apply {
-        if (!exists()) mkdirs()
-    }
-
+class FileVaultEngine internal constructor(
+    private val context: Context,
+    private val keyFactory: (() -> SecretKey)? = null
+) {
+    private val vaultDir = File(context.filesDir, "stealth_vault").apply { mkdirs() }
     private val metaPrefs = context.getSharedPreferences("vault_meta_prefs", Context.MODE_PRIVATE)
-
     private val keyStoreAlias = "CuteMarmot_Vault_Hardware_MasterKey_v1"
 
-    // 历史版本兼容密钥（仅用于向后兼容解密升级前已导入的历史文件，新加密将使用芯片密钥）
+    // Read-only compatibility. Never selected for new encryption.
     private val legacyMasterKeyBytes = byteArrayOf(
         0x53, 0x74, 0x65, 0x61, 0x6C, 0x74, 0x68, 0x56,
         0x61, 0x75, 0x6C, 0x74, 0x4B, 0x65, 0x79, 0x32,
@@ -48,336 +45,170 @@ class FileVaultEngine(private val context: Context) {
     )
     private val legacySecretKey = SecretKeySpec(legacyMasterKeyBytes, "AES")
 
-    /**
-     * 获取或在 Android 硬件安全密钥库 (AndroidKeyStore TEE/StrongBox) 中生成不可导出的 AES-256 主密钥
-     */
+
     private fun getHardwareSecretKey(): SecretKey {
-        return try {
-            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            if (!keyStore.containsAlias(keyStoreAlias)) {
-                val keyGenerator = KeyGenerator.getInstance(
-                    KeyProperties.KEY_ALGORITHM_AES,
-                    "AndroidKeyStore"
-                )
-                val builder = KeyGenParameterSpec.Builder(
-                    keyStoreAlias,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .setKeySize(256)
-                    .setRandomizedEncryptionRequired(false) // 允许手动注入安全随机 IV
-                keyGenerator.init(builder.build())
-                keyGenerator.generateKey()
-            } else {
-                (keyStore.getEntry(keyStoreAlias, null) as KeyStore.SecretKeyEntry).secretKey
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "AndroidKeyStore 初始化失败，降级为兼容密钥: ${e.message}")
-            legacySecretKey
+        keyFactory?.let { return it() }
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        if (keyStore.containsAlias(keyStoreAlias)) {
+            return (keyStore.getEntry(keyStoreAlias, null) as KeyStore.SecretKeyEntry).secretKey
         }
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(KeyGenParameterSpec.Builder(
+            keyStoreAlias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256).build())
+        return generator.generateKey()
     }
 
-    /**
-     * 解析 Uri 对应的真实物理文件路径（支持内部存储与外置 SD 卡）
-     */
-    private fun resolveRealPath(uri: Uri): String? {
-        if (uri.scheme.equals("file", ignoreCase = true)) {
-            return uri.path
+    private fun writeVerified(input: InputStream, target: File, key: SecretKey) {
+        val expected = FileOutputStream(target).use { output ->
+            val digest = VaultCipher.encrypt(input, output, key)
+            output.fd.sync()
+            digest
         }
-        // 1. 直接查询 MediaStore DATA 字段
+        val actual = FileInputStream(target).use {
+            VaultCipher.decrypt(it, discardOutput, key, versioned = true)
+        }
+        check(MessageDigest.isEqual(expected, actual)) { "Vault verification failed" }
+    }
+
+    fun encryptAndImport(sourceUri: Uri): ImportResult {
+        if (sourceUri.scheme != "content") return ImportResult.FAILED
+        val id = UUID.randomUUID().toString()
+        val pending = File(vaultDir, "$id.pending")
+        val encrypted = File(vaultDir, "$id.enc")
         try {
-            val proj = arrayOf(android.provider.MediaStore.MediaColumns.DATA)
-            context.contentResolver.query(uri, proj, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
-                    if (idx != -1) {
-                        val path = cursor.getString(idx)
-                        if (!path.isNullOrBlank()) return path
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-
-        // 2. 解析 DocumentUri
-        if (android.provider.DocumentsContract.isDocumentUri(context, uri)) {
-            val docId = android.provider.DocumentsContract.getDocumentId(uri)
-            if (uri.authority == "com.android.externalstorage.documents") {
-                val split = docId.split(":")
-                val type = split[0]
-                val relativePath = if (split.size > 1) split[1] else ""
-                return if ("primary".equals(type, ignoreCase = true)) {
-                    "/storage/emulated/0/$relativePath"
-                } else {
-                    "/storage/$type/$relativePath"
-                }
-            } else if (uri.authority == "com.android.providers.media.documents") {
-                val split = docId.split(":")
-                val type = split[0]
-                val id = split.getOrNull(1) ?: return null
-                val contentUri = when (type) {
-                    "image" -> android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-                    "video" -> android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    "audio" -> android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                    else -> android.provider.MediaStore.Files.getContentUri("external")
-                }
-                val selection = "_id=?"
-                val selectionArgs = arrayOf(id)
-                context.contentResolver.query(
-                    contentUri,
-                    arrayOf(android.provider.MediaStore.MediaColumns.DATA),
-                    selection,
-                    selectionArgs,
-                    null
-                )?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val idx = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
-                        if (idx != -1) return cursor.getString(idx)
-                    }
-                }
-            }
-        }
-        return null
-    }
-
-    /**
-     * 将用户选中的 Uri (图片/视频/音频/文件) 加密导入安全密柜，并记录原物理路径
-     * @param sourceUri 用户选择的文件 Uri
-     */
-    fun encryptAndImport(sourceUri: Uri): Boolean {
-        return try {
+            val key = getHardwareSecretKey()
             val resolver = context.contentResolver
-            var fileName = "vault_file_${System.currentTimeMillis()}"
-            var fileSize = 0L
-
-            resolver.query(sourceUri, null, null, null, null)?.use { cursor ->
-                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (cursor.moveToFirst()) {
-                    if (nameIndex != -1) fileName = cursor.getString(nameIndex)
-                    if (sizeIndex != -1) fileSize = cursor.getLong(sizeIndex)
+            var displayName = "vault_file"
+            resolver.query(sourceUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                if (it.moveToFirst()) {
+                    val index = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) displayName = safeName(it.getString(index))
                 }
             }
-
-            val originalPath = resolveRealPath(sourceUri)
-            val targetEncFile = File(vaultDir, "${System.currentTimeMillis()}_${fileName}.enc")
-
-            // 生成随机 12 字节 IV 用于 AES-GCM
-            val iv = ByteArray(12)
-            SecureRandom().nextBytes(iv)
-
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val spec = GCMParameterSpec(128, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, getHardwareSecretKey(), spec)
-
-            resolver.openInputStream(sourceUri)?.use { inputStream ->
-                FileOutputStream(targetEncFile).use { fileOut ->
-                    // 头部写入 IV
-                    fileOut.write(iv)
-                    CipherOutputStream(fileOut, cipher).use { cipherOut ->
-                        inputStream.copyTo(cipherOut)
-                    }
-                }
-            }
-
-            // 永久记录该文件原来的物理绝对路径
-            if (!originalPath.isNullOrBlank()) {
-                metaPrefs.edit().putString("${targetEncFile.name}_orig_path", originalPath).apply()
-                Log.i(TAG, "已记录文件原位置: $originalPath")
-            }
-
-            // 自动移除外部原文件（彻底隐藏）：优先系统删除，受限则通过特权清理原处残留
-            var sourceDeleted = false
-            try {
-                if (resolver.delete(sourceUri, null, null) > 0) {
-                    sourceDeleted = true
-                }
-            } catch (_: Exception) {}
-
-            if (!sourceDeleted && !originalPath.isNullOrBlank()) {
-                try {
-                    val srcFile = File(originalPath)
-                    if (srcFile.exists() && srcFile.delete()) {
-                        sourceDeleted = true
-                    }
-                } catch (_: Exception) {}
-                if (!sourceDeleted && ShizukuManager.isPermissionGranted()) {
-                    ShizukuManager.execSync(arrayOf("rm", "-f", originalPath))
-                }
-                MediaScannerConnection.scanFile(context, arrayOf(originalPath), null, null)
-            }
-
-            Log.i(TAG, "成功加密文件: $fileName -> ${targetEncFile.name}")
-            true
+            val input = resolver.openInputStream(sourceUri) ?: throw IOException("No source stream")
+            input.use { writeVerified(it, pending, key) }
+            Os.rename(pending.absolutePath, encrypted.absolutePath)
+            check(encrypted.isFile && !pending.exists()) { "Vault commit failed" }
+            check(metaPrefs.edit().putString("${encrypted.name}_display_name", displayName).commit())
         } catch (e: Exception) {
-            Log.e(TAG, "加密文件失败: ${e.message}", e)
-            false
+            pending.delete()
+            encrypted.delete()
+            metaPrefs.edit().remove("${encrypted.name}_display_name").apply()
+            Log.e(TAG, "导入失败，未删除原文件", e)
+            return ImportResult.FAILED
         }
+        // The grant authorizes only this URI, never a provider-supplied physical path.
+        val removed = try {
+            if (DocumentsContract.isDocumentUri(context, sourceUri)) {
+                DocumentsContract.deleteDocument(context.contentResolver, sourceUri)
+            } else {
+                context.contentResolver.delete(sourceUri, null, null) > 0
+            }
+        } catch (_: Exception) { false }
+        return if (removed) ImportResult.SOURCE_REMOVED else ImportResult.SOURCE_RETAINED
     }
 
-    /**
-     * 列出当前安全密柜中所有的加密文件，并附带原路径信息
-     */
     fun listVaultFiles(): List<VaultFileItem> {
-        val files = vaultDir.listFiles { file -> file.name.endsWith(".enc") } ?: return emptyList()
-        return files.map { file ->
-            val rawName = file.name.removeSuffix(".enc")
-            // 去除时间戳前缀
-            val displayName = rawName.substringAfter("_")
-            val mimeType = when {
-                displayName.endsWith(".jpg", true) || displayName.endsWith(".jpeg", true) || displayName.endsWith(".png", true) -> "image/*"
-                displayName.endsWith(".mp4", true) || displayName.endsWith(".mkv", true) -> "video/*"
-                displayName.endsWith(".mp3", true) || displayName.endsWith(".m4a", true) -> "audio/*"
-                else -> "application/octet-stream"
-            }
-            val originalPath = metaPrefs.getString("${file.name}_orig_path", null)
-            VaultFileItem(
-                id = file.name,
-                originalName = displayName,
-                originalPath = originalPath,
-                mimeType = mimeType,
-                sizeBytes = file.length(),
-                encryptedFile = file
-            )
-        }.sortedByDescending { it.encryptedFile.lastModified() }
+        return vaultDir.listFiles { file -> file.isFile && file.name.endsWith(".enc") }
+            .orEmpty().map { file ->
+                val name = safeName(metaPrefs.getString("${file.name}_display_name", null)
+                    ?: file.name.removeSuffix(".enc").substringAfter("_"))
+                val mime = when (name.substringAfterLast('.', "").lowercase()) {
+                    "jpg", "jpeg", "png" -> "image/*"
+                    "mp4", "mkv" -> "video/*"
+                    "mp3", "m4a" -> "audio/*"
+                    else -> "application/octet-stream"
+                }
+                VaultFileItem(file.name, name, metaPrefs.getString("${file.name}_orig_path", null),
+                    mime, file.length(), file)
+            }.sortedByDescending { it.encryptedFile.lastModified() }
     }
 
-    /**
-     * 使用指定密钥对密文解密到输出文件
-     */
-    private fun decryptFileWithKey(encFile: File, outFile: File, key: SecretKey) {
-        FileInputStream(encFile).use { fileIn ->
-            val iv = ByteArray(12)
-            val readLen = fileIn.read(iv)
-            if (readLen != 12) throw IOException("加密文件头损坏或长度不足")
+    private fun checkedFile(item: VaultFileItem): File {
+        require(item.id == File(item.id).name && item.id.endsWith(".enc"))
+        val file = File(vaultDir, item.id)
+        require(file.canonicalFile.parentFile == vaultDir.canonicalFile && file.isFile)
+        return file
+    }
 
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val spec = GCMParameterSpec(128, iv)
-            cipher.init(Cipher.DECRYPT_MODE, key, spec)
-
-            CipherInputStream(fileIn, cipher).use { cipherIn ->
-                FileOutputStream(outFile).use { fileOut ->
-                    cipherIn.copyTo(fileOut)
-                }
+    private fun decryptTo(source: File, temp: File, key: SecretKey, versioned: Boolean) {
+        FileInputStream(source).use { input ->
+            FileOutputStream(temp).use { output ->
+                VaultCipher.decrypt(input, output, key, versioned)
             }
         }
     }
 
-    /**
-     * 将密柜中的文件解密恢复**直接放回原位置**（支持外置 SD 卡或私密文件夹，智能防重名）
-     */
-    fun decryptAndExport(item: VaultFileItem): Boolean {
-        return try {
-            val origPath = item.originalPath
-            val targetDir: File = if (!origPath.isNullOrBlank()) {
-                val origFile = File(origPath)
-                origFile.parentFile ?: android.os.Environment.getExternalStoragePublicDirectory(
-                    android.os.Environment.DIRECTORY_DOWNLOADS
-                )
+    /** Export to a user-selected URI; retain vault ciphertext after export. */
+    fun decryptAndExport(item: VaultFileItem, destination: Uri): ExportResult {
+        if (destination.scheme != "content") return ExportResult.FAILED
+        val temp = try {
+            File.createTempFile("vault_restore_", ".tmp", context.cacheDir)
+        } catch (e: Exception) {
+            Log.e(TAG, "无法创建私有导出缓存，密柜副本保留", e)
+            return ExportResult.FAILED
+        }
+        try {
+            val source = checkedFile(item)
+            val versioned = FileInputStream(source).use { VaultCipher.isVersioned(it) }
+            if (versioned) {
+                decryptTo(source, temp, getHardwareSecretKey(), true)
             } else {
-                android.os.Environment.getExternalStoragePublicDirectory(
-                    android.os.Environment.DIRECTORY_DOWNLOADS
-                )
-            }
-
-            if (!targetDir.exists()) {
-                targetDir.mkdirs()
-            }
-
-            var outputFile = File(targetDir, item.originalName)
-            // 防覆盖保护：若原位置已有同名文件，自动添加序号
-            if (outputFile.exists()) {
-                val dotIndex = item.originalName.lastIndexOf('.')
-                val base = if (dotIndex != -1) item.originalName.substring(0, dotIndex) else item.originalName
-                val ext = if (dotIndex != -1) item.originalName.substring(dotIndex) else ""
-                var counter = 1
-                while (outputFile.exists()) {
-                    outputFile = File(targetDir, "${base}_已恢复($counter)$ext")
-                    counter++
-                }
-            }
-
-            // 先解密到应用临时私有缓存
-            val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}")
-            var decryptSuccess = false
-
-            // 1. 优先尝试硬件芯片密钥解密
-            try {
-                decryptFileWithKey(item.encryptedFile, tempFile, getHardwareSecretKey())
-                decryptSuccess = true
-            } catch (e: Exception) {
-                Log.w(TAG, "硬件密钥解密未通过，尝试兼容历史旧密钥: ${e.message}")
-                tempFile.delete()
-            }
-
-            // 2. 若失败，尝试使用 legacy 兼容密钥解密（针对旧版本历史文件）
-            if (!decryptSuccess) {
                 try {
-                    decryptFileWithKey(item.encryptedFile, tempFile, legacySecretKey)
-                    decryptSuccess = true
-                    Log.i(TAG, "文件已成功通过历史兼容密钥解密")
+                    decryptTo(source, temp, getHardwareSecretKey(), false)
+                } catch (_: Exception) {
+                    // FileOutputStream truncates any unauthenticated partial plaintext.
+                    decryptTo(source, temp, legacySecretKey, false)
+                }
+            }
+            // Authenticate entirely in private cache before sending bytes to the destination.
+            var migrated = versioned
+            if (!versioned) {
+                val replacement = File.createTempFile("migration_", ".pending", vaultDir)
+                try {
+                    val key = getHardwareSecretKey()
+                    FileInputStream(temp).use { writeVerified(it, replacement, key) }
+                    Os.rename(replacement.absolutePath, source.absolutePath)
+                    migrated = true
                 } catch (e: Exception) {
-                    Log.e(TAG, "双重解密均失败，文件可能已损坏: ${e.message}", e)
-                    tempFile.delete()
-                    return false
+                    Log.w(TAG, "旧文件迁移未完成，保留旧密文", e)
+                } finally {
+                    replacement.delete()
                 }
             }
-
-            // 放回目标原位置（支持外置 SD 卡，若普通 I/O 受限则通过特权完成拷贝）
-            var restored = false
-            try {
-                FileOutputStream(outputFile).use { fileOut ->
-                    FileInputStream(tempFile).use { it.copyTo(fileOut) }
-                }
-                restored = true
-            } catch (e: Exception) {
-                Log.w(TAG, "常规写入原位置受限，启用 Shizuku 特权还原: ${e.message}")
-            }
-
-            if (!restored && ShizukuManager.isPermissionGranted()) {
-                val cmd = ShizukuManager.execSync(arrayOf("cp", tempFile.absolutePath, outputFile.absolutePath))
-                if (cmd.isSuccess) {
-                    restored = true
-                }
-            }
-            tempFile.delete()
-
-            if (restored) {
-                // 物理删除加密密柜里的密文并清理原路径记录
-                item.encryptedFile.delete()
-                metaPrefs.edit().remove("${item.id}_orig_path").apply()
-
-                // 触发系统媒体库扫描刷新，确保原位置相册和播放器立刻显示
-                MediaScannerConnection.scanFile(
-                    context,
-                    arrayOf(outputFile.absolutePath),
-                    null
-                ) { path, uri ->
-                    Log.i(TAG, "文件已成功放回原位置并登记媒体库: $path -> $uri")
-                }
-                true
-            } else {
-                false
-            }
+            val output = context.contentResolver.openOutputStream(destination, "wt")
+                ?: throw IOException("No destination stream")
+            output.use { target -> FileInputStream(temp).use { it.copyTo(target) } }
+            return if (migrated) ExportResult.EXPORTED else ExportResult.EXPORTED_LEGACY_RETAINED
         } catch (e: Exception) {
-            Log.e(TAG, "解密导出失败: ${e.message}", e)
-            false
+            Log.e(TAG, "导出失败，密柜副本保留", e)
+            return ExportResult.FAILED
+        } finally {
+            temp.delete()
         }
     }
 
-    /**
-     * 永久粉碎删除密柜里的某个加密文件
-     */
-    fun shredFile(item: VaultFileItem): Boolean {
-        return try {
-            metaPrefs.edit().remove("${item.id}_orig_path").apply()
-            item.encryptedFile.delete()
-        } catch (e: Exception) {
-            false
-        }
-    }
+    /** Logical deletion only; flash overwrite is not guaranteed. */
+    fun shredFile(item: VaultFileItem): Boolean = try {
+        if (checkedFile(item).delete()) {
+            metaPrefs.edit().remove("${item.id}_orig_path")
+                .remove("${item.id}_display_name").apply()
+            true
+        } else false
+    } catch (_: Exception) { false }
 
     companion object {
         private const val TAG = "FileVaultEngine"
+        internal fun safeName(name: String?): String = name.orEmpty()
+            .map { if (it == '/' || it == '\\' || it.isISOControl()) '_' else it }
+            .joinToString("").take(120)
+            .takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "vault_file"
+        private val discardOutput = object : OutputStream() {
+            override fun write(value: Int) {}
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {}
+        }
     }
 }

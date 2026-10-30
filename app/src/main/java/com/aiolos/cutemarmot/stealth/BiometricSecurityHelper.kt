@@ -33,7 +33,8 @@ class BiometricSecurityHelper(private val activity: FragmentActivity) {
         title: String = "系统安全身份验证",
         subtitle: String = "请验证手机指纹、面容或锁屏密码以继续",
         onSuccess: () -> Unit,
-        onFallback: () -> Unit
+        onFallback: () -> Unit,
+        onError: () -> Unit = {}
     ) {
         if (!canAuthenticateWithDeviceCredential()) {
             Log.w(TAG, "设备尚未设置任何锁屏凭据或指纹，走备用校验通道")
@@ -58,6 +59,8 @@ class BiometricSecurityHelper(private val activity: FragmentActivity) {
                     errorCode == 11
                 ) {
                     onFallback()
+                } else {
+                    onError()
                 }
             }
 

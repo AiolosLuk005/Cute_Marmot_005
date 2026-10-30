@@ -17,7 +17,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import java.io.File
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.aiolos.cutemarmot.MainActivity
+import com.aiolos.cutemarmot.vault.ImportResult
+import com.aiolos.cutemarmot.vault.ExportResult
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +59,33 @@ fun VaultMediaScreen() {
         refreshFiles()
     }
 
+    var pendingExportId by rememberSaveable { mutableStateOf<String?>(null) }
+    var operationNotice by rememberSaveable { mutableStateOf<String?>(null) }
+    val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        val id = pendingExportId
+        pendingExportId = null
+        if (uri != null && id != null) {
+            isProcessing = true
+            scope.launch {
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        vaultEngine.listVaultFiles().find { it.id == id }?.let {
+                            vaultEngine.decryptAndExport(it, uri)
+                        } ?: ExportResult.FAILED
+                    }
+                    operationNotice = when (result) {
+                        ExportResult.EXPORTED -> "已导出到所选位置，密柜副本保留；确认导出文件后可手动删除副本。"
+                        ExportResult.EXPORTED_LEGACY_RETAINED -> "已导出，但旧密文尚未迁移到设备密钥。请在密钥服务恢复后重试；密柜副本保留。"
+                        ExportResult.FAILED -> "导出失败，密柜副本保留。所选位置可能存在不完整文件，请检查。"
+                    }
+                } finally {
+                    isProcessing = false
+                    refreshFiles()
+                }
+            }
+        }
+    }
+
     // 文件选择器
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -67,12 +97,23 @@ fun VaultMediaScreen() {
                     vaultEngine.encryptAndImport(pickedUri)
                 }
                 isProcessing = false
-                if (ok) {
-                    Toast.makeText(context, "文件已安全加密存入隔离密柜", Toast.LENGTH_SHORT).show()
+                operationNotice = when (ok) {
+                    ImportResult.SOURCE_REMOVED -> "文件已加密并校验，文件提供方已确认删除原文件。"
+                    ImportResult.SOURCE_RETAINED -> "已创建加密副本，但原文件仍在原位置，可能仍可被其他人访问。请通过原应用或系统文件管理器删除。"
+                    ImportResult.FAILED -> "导入失败，未删除原文件。请确认设备密钥和存储空间可用。"
                 }
                 refreshFiles()
             }
         }
+    }
+
+    operationNotice?.let { message ->
+        AlertDialog(
+            onDismissRequest = { operationNotice = null },
+            title = { Text("文件操作结果") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { operationNotice = null }) { Text("知道了") } }
+        )
     }
 
     Column(
@@ -259,8 +300,11 @@ fun VaultMediaScreen() {
                     }
 
                     Button(
-                        onClick = { filePicker.launch(arrayOf("*/*")) },
-                        enabled = !isProcessing
+                        onClick = {
+                            (context as? MainActivity)?.markLaunchingExternalSubFlow()
+                            filePicker.launch(arrayOf("*/*"))
+                        },
+                        enabled = !isProcessing && pendingExportId == null
                     ) {
                         Text(if (isProcessing) "加密中..." else "+ 导入文件")
                     }
@@ -268,7 +312,7 @@ fun VaultMediaScreen() {
             }
 
             Text(
-                text = "加密保管库（电脑连线无法提取，沙盒硬件密钥加密）",
+                text = "加密保管库（新文件使用 AndroidKeyStore 设备密钥）",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -296,27 +340,15 @@ fun VaultMediaScreen() {
                     items(vaultFiles, key = { it.id }) { item ->
                         VaultItemRow(
                             item = item,
+                            enabled = !isProcessing && pendingExportId == null,
                             onRestore = {
-                                scope.launch {
-                                    val ok = withContext(Dispatchers.IO) {
-                                        vaultEngine.decryptAndExport(item)
-                                    }
-                                    if (ok) {
-                                        val targetDesc = if (!item.originalPath.isNullOrBlank()) {
-                                            "已成功原路放回：${File(item.originalPath).parentFile?.name ?: "原位置"}"
-                                        } else {
-                                            "已安全放回系统 Download 目录"
-                                        }
-                                        Toast.makeText(context, targetDesc, Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        Toast.makeText(context, "还原失败，请重试", Toast.LENGTH_SHORT).show()
-                                    }
-                                    refreshFiles()
-                                }
+                                pendingExportId = item.id
+                                (context as? MainActivity)?.markLaunchingExternalSubFlow()
+                                exportPicker.launch(item.originalName)
                             },
                             onDelete = {
-                                vaultEngine.shredFile(item)
-                                Toast.makeText(context, "已彻底安全覆写粉碎", Toast.LENGTH_SHORT).show()
+                                val deleted = vaultEngine.shredFile(item)
+                                operationNotice = if (deleted) "密柜副本已删除；不保证闪存物理覆写或其他副本的删除。" else "删除失败，密柜副本仍保留。"
                                 refreshFiles()
                             }
                         )
@@ -331,6 +363,7 @@ fun VaultMediaScreen() {
 fun VaultItemRow(
     item: VaultFileItem,
     onRestore: () -> Unit,
+    enabled: Boolean = true,
     onDelete: () -> Unit
 ) {
     Card(
@@ -387,11 +420,11 @@ fun VaultItemRow(
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = onRestore) {
+                TextButton(onClick = onRestore, enabled = enabled) {
                     Text("恢复")
                 }
-                TextButton(onClick = onDelete) {
-                    Text("粉碎", color = MaterialTheme.colorScheme.error)
+                TextButton(onClick = onDelete, enabled = enabled) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
                 }
             }
         }
