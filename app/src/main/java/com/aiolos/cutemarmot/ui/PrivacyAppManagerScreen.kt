@@ -71,6 +71,19 @@ fun PrivacyAppManagerScreen(
     var selectedProfileId by remember { mutableStateOf(profileManager.getActiveProfileId()) }
     var isApplyingProfile by remember { mutableStateOf(false) }
 
+    // 草稿勾选状态：用户在当前方案下勾选/取消勾选，仅变更此状态，不选一个变一个，全部选好后按保存才执行
+    var draftHiddenPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var draftLockedPackages by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    // 当切换选中的方案时，将该方案的配置载入到草稿中
+    LaunchedEffect(selectedProfileId) {
+        val sel = profiles.find { it.id == selectedProfileId }
+        if (sel != null) {
+            draftHiddenPackages = sel.hiddenPackages
+            draftLockedPackages = sel.lockedPackages
+        }
+    }
+
     // 下拉抽屉状态：默认折叠，留出最大展示空间给下面的 APP 列表
     var isPanelExpanded by remember { mutableStateOf(false) }
 
@@ -86,9 +99,17 @@ fun PrivacyAppManagerScreen(
             apps = list
             isOwner = manager.isDeviceOwner()
             ShizukuManager.updateState()
-            profiles = profileManager.getProfiles()
+            val newProfiles = profileManager.getProfiles()
+            profiles = newProfiles
             activeProfileId = profileManager.getActiveProfileId()
             isSelfIconHidden = iconHideManager.isIconHidden()
+
+            // 同步当前选中方案的草稿状态
+            val currentSel = newProfiles.find { it.id == selectedProfileId }
+            if (currentSel != null) {
+                draftHiddenPackages = currentSel.hiddenPackages
+                draftLockedPackages = currentSel.lockedPackages
+            }
             isLoading = false
         }
     }
@@ -310,6 +331,9 @@ fun PrivacyAppManagerScreen(
 
                                     val selectedProfile = profiles.find { it.id == selectedProfileId }
                                     if (selectedProfile != null) {
+                                        val hasUnsavedChanges = draftHiddenPackages != selectedProfile.hiddenPackages ||
+                                                draftLockedPackages != selectedProfile.lockedPackages
+
                                         // 方案标签
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
@@ -317,11 +341,11 @@ fun PrivacyAppManagerScreen(
                                         ) {
                                             AssistChip(
                                                 onClick = {},
-                                                label = { Text("隐藏 ${selectedProfile.hiddenPackages.size}款", fontSize = 11.sp) }
+                                                label = { Text("待隐藏 ${draftHiddenPackages.size}款", fontSize = 11.sp) }
                                             )
                                             AssistChip(
                                                 onClick = {},
-                                                label = { Text("加锁 ${selectedProfile.lockedPackages.size}款", fontSize = 11.sp) }
+                                                label = { Text("待加锁 ${draftLockedPackages.size}款", fontSize = 11.sp) }
                                             )
                                             AssistChip(
                                                 onClick = {},
@@ -332,15 +356,14 @@ fun PrivacyAppManagerScreen(
                                                     )
                                                 }
                                             )
-                                            AssistChip(
-                                                onClick = {},
-                                                label = {
-                                                    Text(
-                                                        if (selectedProfile.disguiseVault) "密柜隐匿" else "密柜常规",
-                                                        fontSize = 11.sp
-                                                    )
-                                                }
-                                            )
+                                            if (hasUnsavedChanges) {
+                                                AssistChip(
+                                                    onClick = {},
+                                                    label = {
+                                                        Text("● 草稿未保存", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                                                    }
+                                                )
+                                            }
                                         }
 
                                         // 方案操作按钮栏
@@ -352,42 +375,64 @@ fun PrivacyAppManagerScreen(
                                                 onClick = {
                                                     scope.launch {
                                                         isApplyingProfile = true
-                                                        val summary = withContext(Dispatchers.IO) {
-                                                            profileManager.applyProfile(selectedProfile)
+                                                        // 若有加锁项，先静默尝试激活无障碍服务
+                                                        if (draftLockedPackages.isNotEmpty()) {
+                                                            withContext(Dispatchers.IO) {
+                                                                var isServiceEnabled = com.aiolos.cutemarmot.lock.AppLockAccessibilityService.isAccessibilityServiceEnabled(context)
+                                                                if (!isServiceEnabled && ShizukuManager.isPermissionGranted()) {
+                                                                    ShizukuManager.enableAccessibilityServiceSync(context.packageName)
+                                                                }
+                                                            }
                                                         }
-                                                        refreshApps()
-                                                        isApplyingProfile = false
-                                                        Toast.makeText(
-                                                            context,
-                                                            "✅ 已应用方案「${summary.profileName}」(隐藏${summary.hiddenAppsApplied}款，加锁${summary.lockedAppsApplied}款)",
-                                                            Toast.LENGTH_SHORT
-                                                        ).show()
+
+                                                        val updated = profileManager.updateProfileAppSelections(
+                                                            selectedProfile.id,
+                                                            draftHiddenPackages,
+                                                            draftLockedPackages
+                                                        )
+                                                        if (updated != null) {
+                                                            val summary = withContext(Dispatchers.IO) {
+                                                                profileManager.applyProfile(updated)
+                                                            }
+                                                            refreshApps()
+                                                            isApplyingProfile = false
+                                                            Toast.makeText(
+                                                                context,
+                                                                "✅ 方案「${summary.profileName}」已保存并执行生效！(隐藏${summary.hiddenAppsApplied}款，加锁${summary.lockedAppsApplied}款)",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        } else {
+                                                            isApplyingProfile = false
+                                                        }
                                                     }
                                                 },
                                                 enabled = !isApplyingProfile,
-                                                modifier = Modifier.weight(1.2f),
+                                                modifier = Modifier.weight(1.3f),
                                                 contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
                                             ) {
-                                                Text(if (isApplyingProfile) "..." else "⚡ 一键应用", fontSize = 12.sp)
+                                                Text(if (isApplyingProfile) "执行中..." else "💾 保存并应用", fontSize = 12.sp)
                                             }
 
                                             OutlinedButton(
                                                 onClick = {
-                                                    val updated = profileManager.saveCurrentStateToProfile(selectedProfile.id)
+                                                    val updated = profileManager.updateProfileAppSelections(
+                                                        selectedProfile.id,
+                                                        draftHiddenPackages,
+                                                        draftLockedPackages
+                                                    )
                                                     if (updated != null) {
                                                         profiles = profileManager.getProfiles()
-                                                        activeProfileId = selectedProfile.id
                                                         Toast.makeText(
                                                             context,
-                                                            "💾 当前配置已存入方案「${updated.name}」",
+                                                            "💾 方案「${updated.name}」配置已保存（稍后可点击应用生效）",
                                                             Toast.LENGTH_SHORT
                                                         ).show()
                                                     }
                                                 },
-                                                modifier = Modifier.weight(1.2f),
+                                                modifier = Modifier.weight(1.1f),
                                                 contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
                                             ) {
-                                                Text("💾 保存配置", fontSize = 12.sp)
+                                                Text("仅保存模式", fontSize = 12.sp)
                                             }
 
                                             OutlinedButton(
@@ -404,8 +449,6 @@ fun PrivacyAppManagerScreen(
                                     }
 
                                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-
-
 
                                     // 特权模式与 Shizuku 授权状态条
                                     Surface(
@@ -479,8 +522,7 @@ fun PrivacyAppManagerScreen(
                     }
 
                     // 2. 紧凑型搜索框与状态指示
-                    val hiddenCount = remember(apps) { apps.count { it.isHidden } }
-                    val lockedCount = remember(apps) { apps.count { it.isLocked } }
+                    var filterType by remember { mutableIntStateOf(0) } // 0: 全部, 1: 仅看待隐藏, 2: 仅看待加锁
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -501,38 +543,56 @@ fun PrivacyAppManagerScreen(
                                 }
                             }
                         )
+                    }
 
+                    // 过滤标签栏：全部 / 待隐藏 / 待加锁
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
                         FilterChip(
-                            selected = onlyShowHidden,
-                            onClick = { onlyShowHidden = !onlyShowHidden },
-                            label = { Text("隐藏 ($hiddenCount)", fontSize = 11.sp) }
+                            selected = filterType == 0,
+                            onClick = { filterType = 0 },
+                            label = { Text("全部 (${apps.size})", fontSize = 11.sp) }
+                        )
+                        FilterChip(
+                            selected = filterType == 1,
+                            onClick = { filterType = 1 },
+                            label = { Text("待隐藏 (${draftHiddenPackages.size})", fontSize = 11.sp) }
+                        )
+                        FilterChip(
+                            selected = filterType == 2,
+                            onClick = { filterType = 2 },
+                            label = { Text("待加锁 (${draftLockedPackages.size})", fontSize = 11.sp) }
                         )
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    // 友好操作提示横幅
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = "已加锁 $lockedCount 款应用",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            text = "共 ${apps.size} 款应用",
+                            text = "💡 提示：在下方直接勾选本方案需要隐藏或加锁的应用，选好后按上方【💾 保存并应用】执行生效，无需选一个等待一个。",
                             fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.outline
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                         )
                     }
 
-                    // 3. 应用列表展示栏（拥有最大化的屏幕纵向空间）
+                    // 3. 应用列表展示栏
                     val filteredApps = apps.filter {
                         val matchesSearch = it.appName.contains(searchQuery, ignoreCase = true) ||
                                 it.packageName.contains(searchQuery, ignoreCase = true)
-                        val matchesHidden = if (onlyShowHidden) it.isHidden else true
-                        matchesSearch && matchesHidden
+                        val matchesFilter = when (filterType) {
+                            1 -> draftHiddenPackages.contains(it.packageName)
+                            2 -> draftLockedPackages.contains(it.packageName)
+                            else -> true
+                        }
+                        matchesSearch && matchesFilter
                     }
 
                     if (isLoading) {
@@ -552,60 +612,29 @@ fun PrivacyAppManagerScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(filteredApps, key = { it.packageName }) { app ->
+                                val isDraftHidden = draftHiddenPackages.contains(app.packageName)
+                                val isDraftLocked = draftLockedPackages.contains(app.packageName)
+
                                 AppItemRow(
                                     item = app,
+                                    isDraftHidden = isDraftHidden,
+                                    isDraftLocked = isDraftLocked,
                                     enabled = canHide,
-                                    onToggleHide = { shouldHide ->
-                                        scope.launch {
-                                            val success = withContext(Dispatchers.IO) {
-                                                if (shouldHide) {
-                                                    manager.hideApp(app.packageName)
-                                                } else {
-                                                    manager.unhideApp(app.packageName)
-                                                }
-                                            }
-                                            if (success) {
-                                                refreshApps()
-                                            } else {
-                                                withContext(Dispatchers.Main) {
-                                                    val msg = if (!manager.isShizukuReady() && !manager.isDeviceOwner()) {
-                                                        "操作失败：请确认 Shizuku 正在运行且已授权"
-                                                    } else {
-                                                        "操作失败：该应用可能处于系统休眠保护中，请重试"
-                                                    }
-                                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                                }
-                                            }
+                                    onToggleDraftHide = { shouldHide ->
+                                        // 纯内存草稿变更：选好后统一按保存键执行，不每次重新读取列表
+                                        draftHiddenPackages = if (shouldHide) {
+                                            draftHiddenPackages + app.packageName
+                                        } else {
+                                            draftHiddenPackages - app.packageName
                                         }
                                     },
-                                    onToggleLock = { shouldLock ->
-                                        if (shouldLock) {
-                                            scope.launch {
-                                                val isServiceOn = withContext(Dispatchers.IO) {
-                                                    var enabled = com.aiolos.cutemarmot.lock.AppLockAccessibilityService.isAccessibilityServiceEnabled(context)
-                                                    if (!enabled && ShizukuManager.isPermissionGranted()) {
-                                                        ShizukuManager.enableAccessibilityServiceSync(context.packageName)
-                                                        enabled = com.aiolos.cutemarmot.lock.AppLockAccessibilityService.isAccessibilityServiceEnabled(context)
-                                                    }
-                                                    enabled
-                                                }
-                                                if (!isServiceOn) {
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(
-                                                            context,
-                                                            "⚠️ 加锁需开启无障碍权限，请在随后页面开启「Cute Marmot / 系统高级设置」",
-                                                            Toast.LENGTH_LONG
-                                                        ).show()
-                                                        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                        }
-                                                        context.startActivity(intent)
-                                                    }
-                                                }
-                                            }
+                                    onToggleDraftLock = { shouldLock ->
+                                        // 纯内存草稿变更：选好后统一按保存键执行，不每次重新读取列表
+                                        draftLockedPackages = if (shouldLock) {
+                                            draftLockedPackages + app.packageName
+                                        } else {
+                                            draftLockedPackages - app.packageName
                                         }
-                                        appLockRepo.setAppLocked(app.packageName, shouldLock)
-                                        refreshApps()
                                     }
                                 )
                             }
@@ -620,15 +649,19 @@ fun PrivacyAppManagerScreen(
 @Composable
 fun AppItemRow(
     item: AppInfoItem,
+    isDraftHidden: Boolean,
+    isDraftLocked: Boolean,
     enabled: Boolean,
-    onToggleHide: (Boolean) -> Unit,
-    onToggleLock: (Boolean) -> Unit = {}
+    onToggleDraftHide: (Boolean) -> Unit,
+    onToggleDraftLock: (Boolean) -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (item.isHidden)
-                MaterialTheme.colorScheme.surfaceVariant
+            containerColor = if (isDraftHidden)
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f)
+            else if (isDraftLocked)
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
             else
                 MaterialTheme.colorScheme.surface
         ),
@@ -670,19 +703,25 @@ fun AppItemRow(
                     color = MaterialTheme.colorScheme.outline,
                     maxLines = 1
                 )
-                if (item.isHidden) {
+                if (isDraftHidden) {
                     Text(
-                        text = "● 已在桌面和系统隐藏",
+                        text = "● 设定为隐藏 (保存后从桌面隐形)",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.error,
                         fontWeight = FontWeight.Medium
                     )
-                } else if (item.isLocked) {
+                } else if (isDraftLocked) {
                     Text(
-                        text = "🔒 已加锁 (打开需指纹/手势)",
+                        text = "🔒 设定为加锁 (保存后打开需验证)",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Medium
+                    )
+                } else if (item.isHidden) {
+                    Text(
+                        text = "（当前系统已处于隐藏状态）",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.outline
                     )
                 }
             }
@@ -695,7 +734,7 @@ fun AppItemRow(
                         Modifier.clickable {
                             Toast.makeText(
                                 context,
-                                "⚠️ 隐藏应用需授权 Shizuku；请在上方卡片点击「点击授权」，或直接开启下方「加锁」指纹保护！",
+                                "⚠️ 隐藏应用需授权 Shizuku；请在上方卡片点击「点击授权」，或直接开启下方「加锁」保护！",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -704,8 +743,8 @@ fun AppItemRow(
                     Text("隐藏", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
                     Spacer(modifier = Modifier.width(4.dp))
                     Switch(
-                        checked = item.isHidden,
-                        onCheckedChange = { onToggleHide(it) },
+                        checked = isDraftHidden,
+                        onCheckedChange = { onToggleDraftHide(it) },
                         enabled = enabled
                     )
                 }
@@ -713,8 +752,8 @@ fun AppItemRow(
                     Text("加锁", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
                     Spacer(modifier = Modifier.width(4.dp))
                     Switch(
-                        checked = item.isLocked,
-                        onCheckedChange = { onToggleLock(it) },
+                        checked = isDraftLocked,
+                        onCheckedChange = { onToggleDraftLock(it) },
                         enabled = true
                     )
                 }

@@ -111,11 +111,13 @@ object ShizukuManager {
 
     /**
      * 同步执行 shell 命令（阻塞当前线程，需在 IO 线程调用）
+     * 采用双流并发读取 + finally process.destroy()，避免管道死锁挂起或资源残留
      */
     fun execSync(cmd: Array<String>): ShizukuCommandResult {
         if (!isPermissionGranted()) {
             return ShizukuCommandResult(-1, "", "Shizuku 未授权或未运行")
         }
+        var process: Process? = null
         return try {
             val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
@@ -123,14 +125,41 @@ object ShizukuManager {
                 Array<String>::class.java,
                 String::class.java
             ).apply { isAccessible = true }
-            val process = newProcessMethod.invoke(null, cmd, null, null) as Process
-            val stdout = process.inputStream.bufferedReader().use { it.readText() }
-            val stderr = process.errorStream.bufferedReader().use { it.readText() }
+            process = newProcessMethod.invoke(null, cmd, null, null) as Process
+
+            val stdoutBuilder = StringBuilder()
+            val stderrBuilder = StringBuilder()
+
+            val stdoutThread = Thread {
+                try {
+                    process.inputStream.bufferedReader().useLines { lines ->
+                        lines.forEach { stdoutBuilder.appendLine(it) }
+                    }
+                } catch (_: Exception) {}
+            }
+            val stderrThread = Thread {
+                try {
+                    process.errorStream.bufferedReader().useLines { lines ->
+                        lines.forEach { stderrBuilder.appendLine(it) }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            stdoutThread.start()
+            stderrThread.start()
+
             val exitCode = process.waitFor()
-            ShizukuCommandResult(exitCode, stdout.trim(), stderr.trim())
+            stdoutThread.join(1000)
+            stderrThread.join(1000)
+
+            ShizukuCommandResult(exitCode, stdoutBuilder.toString().trim(), stderrBuilder.toString().trim())
         } catch (e: Exception) {
             Log.e(TAG, "Shizuku execSync error: ${e.message}")
             ShizukuCommandResult(-1, "", e.message ?: "未知异常")
+        } finally {
+            try {
+                process?.destroy()
+            } catch (_: Exception) {}
         }
     }
 
@@ -145,21 +174,35 @@ object ShizukuManager {
      * 隐藏应用（通过 pm disable-user --user 0 彻底隐形，从桌面、应用抽屉与系统设置中完全消失，保留全部数据与APK）
      */
     fun hideAppSync(packageName: String): Boolean {
+        // 尝试方式 1：标准 pm disable-user
         var result = execSync(arrayOf("pm", "disable-user", "--user", "0", packageName))
         Log.i(TAG, "hideAppSync $packageName (attempt 1): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
-        if (result.isSuccess || result.stdout.contains("disabled", ignoreCase = true)) {
+        if (isHideSuccess(result)) {
             return true
         }
 
-        // 若因三星系统「深度休眠」(SecurityException) 导致首次失败，尝试唤醒并自动重试
+        // 尝试方式 2：唤醒 standby bucket 并使用 cmd package 重试
         execSync(arrayOf("am", "set-standby-bucket", packageName, "active"))
         try {
-            Thread.sleep(250)
+            Thread.sleep(150)
         } catch (_: Exception) {}
 
-        result = execSync(arrayOf("pm", "disable-user", "--user", "0", packageName))
-        Log.i(TAG, "hideAppSync $packageName (attempt 2): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
-        return result.isSuccess || result.stdout.contains("disabled", ignoreCase = true)
+        result = execSync(arrayOf("cmd", "package", "disable-user", "--user", "0", packageName))
+        Log.i(TAG, "hideAppSync $packageName (attempt 2 cmd): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
+        if (isHideSuccess(result)) {
+            return true
+        }
+
+        // 尝试方式 3：直接 pm disable 备用
+        result = execSync(arrayOf("pm", "disable", packageName))
+        Log.i(TAG, "hideAppSync $packageName (attempt 3 disable): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
+        return isHideSuccess(result)
+    }
+
+    private fun isHideSuccess(result: ShizukuCommandResult): Boolean {
+        if (result.isSuccess) return true
+        val combined = "${result.stdout} ${result.stderr}".lowercase()
+        return combined.contains("disabled") || combined.contains("new state")
     }
 
     /**
@@ -168,17 +211,23 @@ object ShizukuManager {
     fun unhideAppSync(packageName: String): Boolean {
         var result = execSync(arrayOf("pm", "enable", "--user", "0", packageName))
         Log.i(TAG, "unhideAppSync $packageName (attempt 1): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
-        if (result.isSuccess || result.stdout.contains("enabled", ignoreCase = true)) {
+        if (isUnhideSuccess(result)) {
             return true
         }
 
         try {
-            Thread.sleep(200)
+            Thread.sleep(150)
         } catch (_: Exception) {}
 
-        result = execSync(arrayOf("pm", "enable", "--user", "0", packageName))
-        Log.i(TAG, "unhideAppSync $packageName (attempt 2): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
-        return result.isSuccess || result.stdout.contains("enabled", ignoreCase = true)
+        result = execSync(arrayOf("cmd", "package", "enable", "--user", "0", packageName))
+        Log.i(TAG, "unhideAppSync $packageName (attempt 2 cmd): exitCode=${result.exitCode}, out=${result.stdout}, err=${result.stderr}")
+        return isUnhideSuccess(result)
+    }
+
+    private fun isUnhideSuccess(result: ShizukuCommandResult): Boolean {
+        if (result.isSuccess) return true
+        val combined = "${result.stdout} ${result.stderr}".lowercase()
+        return combined.contains("enabled") || combined.contains("new state")
     }
 
     /**

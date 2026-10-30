@@ -162,7 +162,16 @@ class AppHideManager(private val context: Context) {
             } catch (_: Exception) {}
         }
 
-        // 2. 检查 Cute Marmot 维护的隐藏清单
+        // 2. 检查系统真实组件状态（通过 disable-user 隐藏的包）
+        try {
+            val state = context.packageManager.getApplicationEnabledSetting(packageName)
+            if (state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER ||
+                state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                return true
+            }
+        } catch (_: Exception) {}
+
+        // 3. 检查 Cute Marmot 维护的隐藏清单
         if (getHiddenPackages().contains(packageName)) {
             return true
         }
@@ -176,6 +185,7 @@ class AppHideManager(private val context: Context) {
     fun getInstalledApps(): List<AppInfoItem> {
         val pm = context.packageManager
         val flags = PackageManager.GET_META_DATA or
+                PackageManager.MATCH_UNINSTALLED_PACKAGES or
                 PackageManager.MATCH_DISABLED_COMPONENTS
         val installed = pm.getInstalledApplications(flags)
         val list = mutableListOf<AppInfoItem>()

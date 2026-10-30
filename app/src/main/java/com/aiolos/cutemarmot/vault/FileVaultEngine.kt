@@ -5,6 +5,11 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyStore
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import java.io.*
 import java.security.SecureRandom
 import javax.crypto.Cipher
@@ -32,14 +37,46 @@ class FileVaultEngine(private val context: Context) {
 
     private val metaPrefs = context.getSharedPreferences("vault_meta_prefs", Context.MODE_PRIVATE)
 
-    // 默认内置的 AES-256 派生安全密钥 (32 字节)
-    private val masterKeyBytes = byteArrayOf(
+    private val keyStoreAlias = "CuteMarmot_Vault_Hardware_MasterKey_v1"
+
+    // 历史版本兼容密钥（仅用于向后兼容解密升级前已导入的历史文件，新加密将使用芯片密钥）
+    private val legacyMasterKeyBytes = byteArrayOf(
         0x53, 0x74, 0x65, 0x61, 0x6C, 0x74, 0x68, 0x56,
         0x61, 0x75, 0x6C, 0x74, 0x4B, 0x65, 0x79, 0x32,
         0x30, 0x32, 0x36, 0x41, 0x69, 0x6F, 0x6C, 0x6F,
         0x73, 0x4C, 0x75, 0x6B, 0x30, 0x30, 0x35, 0x21
     )
-    private val secretKey = SecretKeySpec(masterKeyBytes, "AES")
+    private val legacySecretKey = SecretKeySpec(legacyMasterKeyBytes, "AES")
+
+    /**
+     * 获取或在 Android 硬件安全密钥库 (AndroidKeyStore TEE/StrongBox) 中生成不可导出的 AES-256 主密钥
+     */
+    private fun getHardwareSecretKey(): SecretKey {
+        return try {
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            if (!keyStore.containsAlias(keyStoreAlias)) {
+                val keyGenerator = KeyGenerator.getInstance(
+                    KeyProperties.KEY_ALGORITHM_AES,
+                    "AndroidKeyStore"
+                )
+                val builder = KeyGenParameterSpec.Builder(
+                    keyStoreAlias,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .setRandomizedEncryptionRequired(false) // 允许手动注入安全随机 IV
+                keyGenerator.init(builder.build())
+                keyGenerator.generateKey()
+            } else {
+                (keyStore.getEntry(keyStoreAlias, null) as KeyStore.SecretKeyEntry).secretKey
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "AndroidKeyStore 初始化失败，降级为兼容密钥: ${e.message}")
+            legacySecretKey
+        }
+    }
 
     /**
      * 解析 Uri 对应的真实物理文件路径（支持内部存储与外置 SD 卡）
@@ -131,7 +168,7 @@ class FileVaultEngine(private val context: Context) {
 
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val spec = GCMParameterSpec(128, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, spec)
+            cipher.init(Cipher.ENCRYPT_MODE, getHardwareSecretKey(), spec)
 
             resolver.openInputStream(sourceUri)?.use { inputStream ->
                 FileOutputStream(targetEncFile).use { fileOut ->
@@ -206,6 +243,27 @@ class FileVaultEngine(private val context: Context) {
     }
 
     /**
+     * 使用指定密钥对密文解密到输出文件
+     */
+    private fun decryptFileWithKey(encFile: File, outFile: File, key: SecretKey) {
+        FileInputStream(encFile).use { fileIn ->
+            val iv = ByteArray(12)
+            val readLen = fileIn.read(iv)
+            if (readLen != 12) throw IOException("加密文件头损坏或长度不足")
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val spec = GCMParameterSpec(128, iv)
+            cipher.init(Cipher.DECRYPT_MODE, key, spec)
+
+            CipherInputStream(fileIn, cipher).use { cipherIn ->
+                FileOutputStream(outFile).use { fileOut ->
+                    cipherIn.copyTo(fileOut)
+                }
+            }
+        }
+    }
+
+    /**
      * 将密柜中的文件解密恢复**直接放回原位置**（支持外置 SD 卡或私密文件夹，智能防重名）
      */
     fun decryptAndExport(item: VaultFileItem): Boolean {
@@ -241,18 +299,27 @@ class FileVaultEngine(private val context: Context) {
 
             // 先解密到应用临时私有缓存
             val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}")
-            FileInputStream(item.encryptedFile).use { fileIn ->
-                val iv = ByteArray(12)
-                fileIn.read(iv)
+            var decryptSuccess = false
 
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                val spec = GCMParameterSpec(128, iv)
-                cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+            // 1. 优先尝试硬件芯片密钥解密
+            try {
+                decryptFileWithKey(item.encryptedFile, tempFile, getHardwareSecretKey())
+                decryptSuccess = true
+            } catch (e: Exception) {
+                Log.w(TAG, "硬件密钥解密未通过，尝试兼容历史旧密钥: ${e.message}")
+                tempFile.delete()
+            }
 
-                CipherInputStream(fileIn, cipher).use { cipherIn ->
-                    FileOutputStream(tempFile).use { fileOut ->
-                        cipherIn.copyTo(fileOut)
-                    }
+            // 2. 若失败，尝试使用 legacy 兼容密钥解密（针对旧版本历史文件）
+            if (!decryptSuccess) {
+                try {
+                    decryptFileWithKey(item.encryptedFile, tempFile, legacySecretKey)
+                    decryptSuccess = true
+                    Log.i(TAG, "文件已成功通过历史兼容密钥解密")
+                } catch (e: Exception) {
+                    Log.e(TAG, "双重解密均失败，文件可能已损坏: ${e.message}", e)
+                    tempFile.delete()
+                    return false
                 }
             }
 

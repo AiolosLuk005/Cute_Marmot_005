@@ -110,6 +110,28 @@ class StealthProfileManager(private val context: Context) {
     }
 
     /**
+     * 更新指定方案的目标隐藏与加锁应用名单并持久化保存
+     */
+    fun updateProfileAppSelections(
+        profileId: String,
+        hiddenPackages: Set<String>,
+        lockedPackages: Set<String>
+    ): StealthProfile? {
+        val list = getProfiles().toMutableList()
+        val index = list.indexOfFirst { it.id == profileId }
+        if (index == -1) return null
+
+        val updated = list[index].copy(
+            hiddenPackages = hiddenPackages,
+            lockedPackages = lockedPackages
+        )
+        list[index] = updated
+        saveProfiles(list)
+        Log.i(TAG, "已更新方案 ${updated.name} 的应用配置: 隐藏${hiddenPackages.size}款, 加锁${lockedPackages.size}款")
+        return updated
+    }
+
+    /**
      * 将当前手机上实时配置（隐藏、加锁、USB开关、自身隐身、密柜隐身）保存覆盖到指定方案
      */
     fun saveCurrentStateToProfile(profileId: String): StealthProfile? {
@@ -161,10 +183,12 @@ class StealthProfileManager(private val context: Context) {
                     if (appHideManager.hideApp(app.packageName)) {
                         hiddenCount++
                     }
+                    kotlinx.coroutines.delay(150) // 关键延迟缓冲：让系统 PMS 有充足时间写入状态广播，避免并发冲突导致后续应用失败
                 } else if (!shouldBeHidden && app.isHidden) {
                     if (appHideManager.unhideApp(app.packageName)) {
                         unhiddenCount++
                     }
+                    kotlinx.coroutines.delay(150) // 关键延迟缓冲
                 }
             }
         }

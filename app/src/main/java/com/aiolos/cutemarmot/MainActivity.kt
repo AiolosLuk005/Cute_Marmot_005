@@ -34,18 +34,7 @@ class MainActivity : FragmentActivity() {
                         AppMode.NORMAL_FAKE -> {
                             FakeSettingsScreen(
                                 onRequestBiometricAuth = {
-                                    // 连击 5 次触发后，直接调用系统级指纹/手势/锁屏密码
-                                    biometricHelper.authenticate(
-                                        title = "设备安全校验",
-                                        subtitle = "验证指纹、面容或锁屏密码以进入高级维护空间",
-                                        onSuccess = {
-                                            currentMode = AppMode.STEALTH_VAULT
-                                        },
-                                        onFallback = {
-                                            // 若设备无生物识别则自动进入备选输入或直接放行
-                                            currentMode = AppMode.STEALTH_VAULT
-                                        }
-                                    )
+                                    requestUnlockToStealthVault()
                                 }
                             )
                         }
@@ -70,8 +59,32 @@ class MainActivity : FragmentActivity() {
     private fun handleIntent(intent: Intent?) {
         val triggerSource = intent?.getStringExtra("EXTRA_TRIGGER_SOURCE")
         if (triggerSource == "SECRET_CODE") {
-            // 暗码唤醒也可以直接解锁或者请求指纹
-            currentMode = AppMode.STEALTH_VAULT
+            // 外部暗码唤醒或 Intent 调用时，强制调起系统级生物识别/锁屏凭据，杜绝任何免密越权！
+            window.decorView.post {
+                requestUnlockToStealthVault()
+            }
         }
+    }
+
+    /**
+     * 统一安全入口：无论从高仿设置界面触发、还是通过暗码/外部Intent唤醒，均必须通过强身份验证
+     */
+    private fun requestUnlockToStealthVault() {
+        biometricHelper.authenticate(
+            title = "设备安全校验",
+            subtitle = "验证指纹、面容或锁屏密码以进入高级维护空间",
+            onSuccess = {
+                currentMode = AppMode.STEALTH_VAULT
+            },
+            onFallback = {
+                // 如果设备未设置任何生物识别或锁屏密码，提示用户设置，绝不直接放行进入密柜
+                android.widget.Toast.makeText(
+                    this,
+                    "为了您的数据安全，请先在系统设置中设置锁屏密码或指纹",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                currentMode = AppMode.NORMAL_FAKE
+            }
+        )
     }
 }

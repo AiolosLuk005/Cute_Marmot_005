@@ -16,3 +16,6 @@ captures/
 
 # Local configs
 local.properties
+
+# Security Notes (Local Only)
+SECURITY_AUDIT.md
